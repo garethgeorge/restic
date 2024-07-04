@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -54,6 +55,7 @@ type LsOptions struct {
 	Recursive     bool
 	HumanReadable bool
 	Ncdu          bool
+	DirsFromStdin bool
 }
 
 var lsOptions LsOptions
@@ -67,6 +69,7 @@ func init() {
 	flags.BoolVar(&lsOptions.Recursive, "recursive", false, "include files in subfolders of the listed directories")
 	flags.BoolVar(&lsOptions.HumanReadable, "human-readable", false, "print sizes in human readable format")
 	flags.BoolVar(&lsOptions.Ncdu, "ncdu", false, "output NCDU export format (pipe into 'ncdu -f -')")
+	flags.BoolVar(&lsOptions.DirsFromStdin, "dirs-from-stdin", false, "read directories to list from stdin, one per line")
 }
 
 type lsPrinter interface {
@@ -257,56 +260,13 @@ func (p *textLsPrinter) LeaveDir(_ string) {}
 func (p *textLsPrinter) Close()            {}
 
 func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []string) error {
+	t := time.Now()
+
 	if len(args) == 0 {
 		return errors.Fatal("no snapshot ID specified, specify snapshot ID or use special ID 'latest'")
 	}
 	if opts.Ncdu && gopts.JSON {
 		return errors.Fatal("only either '--json' or '--ncdu' can be specified")
-	}
-
-	// extract any specific directories to walk
-	var dirs []string
-	if len(args) > 1 {
-		dirs = args[1:]
-		for _, dir := range dirs {
-			if !strings.HasPrefix(dir, "/") {
-				return errors.Fatal("All path filters must be absolute, starting with a forward slash '/'")
-			}
-		}
-	}
-
-	withinDir := func(nodepath string) bool {
-		if len(dirs) == 0 {
-			return true
-		}
-
-		for _, dir := range dirs {
-			// we're within one of the selected dirs, example:
-			//   nodepath: "/test/foo"
-			//   dir:      "/test"
-			if fs.HasPathPrefix(dir, nodepath) {
-				return true
-			}
-		}
-		return false
-	}
-
-	approachingMatchingTree := func(nodepath string) bool {
-		if len(dirs) == 0 {
-			return true
-		}
-
-		for _, dir := range dirs {
-			// the current node path is a prefix for one of the
-			// directories, so we're interested in something deeper in the
-			// tree. Example:
-			//   nodepath: "/test"
-			//   dir:      "/test/foo"
-			if fs.HasPathPrefix(nodepath, dir) {
-				return true
-			}
-		}
-		return false
 	}
 
 	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
@@ -327,85 +287,164 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 
 	var printer lsPrinter
 
-	if gopts.JSON {
-		printer = &jsonLsPrinter{
-			enc: json.NewEncoder(globalOptions.stdout),
-		}
-	} else if opts.Ncdu {
-		printer = &ncduLsPrinter{
-			out: globalOptions.stdout,
-		}
-	} else {
-		printer = &textLsPrinter{
-			dirs:          dirs,
-			ListLong:      opts.ListLong,
-			HumanReadable: opts.HumanReadable,
+	// extract any specific directories to walk
+	var dirs []string
+	if len(args) > 1 {
+		dirs = args[1:]
+		if err := validateDirs(dirs); err != nil {
+			return err
 		}
 	}
 
-	sn, subfolder, err := (&restic.SnapshotFilter{
-		Hosts: opts.Hosts,
-		Paths: opts.Paths,
-		Tags:  opts.Tags,
-	}).FindLatest(ctx, snapshotLister, repo, args[0])
-	if err != nil {
-		return err
-	}
+	fmt.Fprintf(gopts.stdout, "Initialization took %v\n", time.Since(t))
 
-	sn.Tree, err = restic.FindTreeDirectory(ctx, repo, sn.Tree, subfolder)
-	if err != nil {
-		return err
-	}
+	scanner := bufio.NewScanner(os.Stdin)
+	firstPass := true
+	for {
+		if opts.DirsFromStdin && len(dirs) == 0 {
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return errors.Fatalf("error reading directories from stdin: %v", err)
+				}
+				break
+			}
+			dirs = append(dirs, scanner.Text())
+			if err := validateDirs(dirs); err != nil {
+				return err
+			}
+		} else if !firstPass {
+			break
+		}
+		firstPass = false
 
-	printer.Snapshot(sn)
+		t := time.Now()
 
-	processNode := func(_ restic.ID, nodepath string, node *restic.Node, err error) error {
+		if gopts.JSON {
+			printer = &jsonLsPrinter{
+				enc: json.NewEncoder(globalOptions.stdout),
+			}
+		} else if opts.Ncdu {
+			printer = &ncduLsPrinter{
+				out: globalOptions.stdout,
+			}
+		} else {
+			printer = &textLsPrinter{
+				dirs:          dirs,
+				ListLong:      opts.ListLong,
+				HumanReadable: opts.HumanReadable,
+			}
+		}
+
+		sn, subfolder, err := (&restic.SnapshotFilter{
+			Hosts: opts.Hosts,
+			Paths: opts.Paths,
+			Tags:  opts.Tags,
+		}).FindLatest(ctx, snapshotLister, repo, args[0])
 		if err != nil {
 			return err
 		}
-		if node == nil {
-			return nil
+
+		sn.Tree, err = restic.FindTreeDirectory(ctx, repo, sn.Tree, subfolder)
+		if err != nil {
+			return err
 		}
 
-		if withinDir(nodepath) {
-			// if we're within a dir, print the node
-			printer.Node(nodepath, node)
+		printer.Snapshot(sn)
 
-			// if recursive listing is requested, signal the walker that it
-			// should continue walking recursively
-			if opts.Recursive {
+		withinDir := func(nodepath string) bool {
+			if len(dirs) == 0 {
+				return true
+			}
+
+			for _, dir := range dirs {
+				// we're within one of the selected dirs, example:
+				//   nodepath: "/test/foo"
+				//   dir:      "/test"
+				if fs.HasPathPrefix(dir, nodepath) {
+					return true
+				}
+			}
+			return false
+		}
+
+		approachingMatchingTree := func(nodepath string) bool {
+			if len(dirs) == 0 {
+				return true
+			}
+
+			for _, dir := range dirs {
+				// the current node path is a prefix for one of the
+				// directories, so we're interested in something deeper in the
+				// tree. Example:
+				//   nodepath: "/test"
+				//   dir:      "/test/foo"
+				if fs.HasPathPrefix(nodepath, dir) {
+					return true
+				}
+			}
+			return false
+		}
+
+		processNode := func(_ restic.ID, nodepath string, node *restic.Node, err error) error {
+			if err != nil {
+				return err
+			}
+			if node == nil {
 				return nil
 			}
-		}
 
-		// if there's an upcoming match deeper in the tree (but we're not
-		// there yet), signal the walker to descend into any subdirs
-		if approachingMatchingTree(nodepath) {
+			if withinDir(nodepath) {
+				// if we're within a dir, print the node
+				printer.Node(nodepath, node)
+
+				// if recursive listing is requested, signal the walker that it
+				// should continue walking recursively
+				if opts.Recursive {
+					return nil
+				}
+			}
+
+			// if there's an upcoming match deeper in the tree (but we're not
+			// there yet), signal the walker to descend into any subdirs
+			if approachingMatchingTree(nodepath) {
+				return nil
+			}
+
+			// otherwise, signal the walker to not walk recursively into any
+			// subdirs
+			if node.Type == "dir" {
+				return walker.ErrSkipNode
+			}
 			return nil
 		}
 
-		// otherwise, signal the walker to not walk recursively into any
-		// subdirs
-		if node.Type == "dir" {
-			return walker.ErrSkipNode
+		err = walker.Walk(ctx, repo, *sn.Tree, walker.WalkVisitor{
+			ProcessNode: processNode,
+			LeaveDir: func(path string) {
+				// the root path `/` has no corresponding node and is thus also skipped by processNode
+				if withinDir(path) && path != "/" {
+					printer.LeaveDir(path)
+				}
+			},
+		})
+
+		if err != nil {
+			return err
 		}
-		return nil
+		printer.Close()
+
+		fmt.Fprintf(gopts.stdout, "Listing took %v\n", time.Since(t))
+
+		dirs = dirs[:0]
 	}
+	return nil
+}
 
-	err = walker.Walk(ctx, repo, *sn.Tree, walker.WalkVisitor{
-		ProcessNode: processNode,
-		LeaveDir: func(path string) {
-			// the root path `/` has no corresponding node and is thus also skipped by processNode
-			if withinDir(path) && path != "/" {
-				printer.LeaveDir(path)
-			}
-		},
-	})
-
-	if err != nil {
-		return err
+func validateDirs(dirs []string) error {
+	for _, dir := range dirs {
+		if !strings.HasPrefix(dir, "/") {
+			return errors.Fatal("All path filters must be absolute, starting with a forward slash '/'")
+		}
 	}
-
-	printer.Close()
 	return nil
 }
