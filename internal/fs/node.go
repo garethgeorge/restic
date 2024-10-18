@@ -12,9 +12,25 @@ import (
 	"github.com/restic/restic/internal/restic"
 )
 
-// NodeFromFileInfo returns a new node from the given path and FileInfo. It
+// nodeFromFileInfo returns a new node from the given path and FileInfo. It
 // returns the first error that is encountered, together with a node.
-func NodeFromFileInfo(path string, fi os.FileInfo, ignoreXattrListError bool) (*restic.Node, error) {
+func nodeFromFileInfo(path string, fi os.FileInfo, ignoreXattrListError bool) (*restic.Node, error) {
+	node := buildBasicNode(path, fi)
+
+	stat := ExtendedStat(fi)
+	if err := nodeFillExtendedStat(node, path, &stat); err != nil {
+		return node, err
+	}
+
+	allowExtended, err := nodeFillGenericAttributes(node, path, &stat)
+	if allowExtended {
+		// Skip processing ExtendedAttributes if allowExtended is false.
+		err = errors.Join(err, nodeFillExtendedAttributes(node, path, ignoreXattrListError))
+	}
+	return node, err
+}
+
+func buildBasicNode(path string, fi os.FileInfo) *restic.Node {
 	mask := os.ModePerm | os.ModeType | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
 	node := &restic.Node{
 		Path:    path,
@@ -27,9 +43,7 @@ func NodeFromFileInfo(path string, fi os.FileInfo, ignoreXattrListError bool) (*
 	if node.Type == restic.NodeTypeFile {
 		node.Size = uint64(fi.Size())
 	}
-
-	err := nodeFillExtra(node, path, fi, ignoreXattrListError)
-	return node, err
+	return node
 }
 
 func nodeTypeFromFileInfo(fi os.FileInfo) restic.NodeType {
@@ -55,17 +69,7 @@ func nodeTypeFromFileInfo(fi os.FileInfo) restic.NodeType {
 	return restic.NodeTypeInvalid
 }
 
-func nodeFillExtra(node *restic.Node, path string, fi os.FileInfo, ignoreXattrListError bool) error {
-	if fi.Sys() == nil {
-		// fill minimal info with current values for uid, gid
-		node.UID = uint32(os.Getuid())
-		node.GID = uint32(os.Getgid())
-		node.ChangeTime = node.ModTime
-		return nil
-	}
-
-	stat := ExtendedStat(fi)
-
+func nodeFillExtendedStat(node *restic.Node, path string, stat *ExtendedFileInfo) error {
 	node.Inode = stat.Inode
 	node.DeviceID = stat.DeviceID
 	node.ChangeTime = stat.ChangeTime
@@ -99,13 +103,7 @@ func nodeFillExtra(node *restic.Node, path string, fi os.FileInfo, ignoreXattrLi
 	default:
 		return errors.Errorf("unsupported file type %q", node.Type)
 	}
-
-	allowExtended, err := nodeFillGenericAttributes(node, path, &stat)
-	if allowExtended {
-		// Skip processing ExtendedAttributes if allowExtended is false.
-		err = errors.CombineErrors(err, nodeFillExtendedAttributes(node, path, ignoreXattrListError))
-	}
-	return err
+	return nil
 }
 
 var (
@@ -163,41 +161,29 @@ func lookupGroup(gid uint32) string {
 }
 
 // NodeCreateAt creates the node at the given path but does NOT restore node meta data.
-func NodeCreateAt(node *restic.Node, path string) error {
+func NodeCreateAt(node *restic.Node, path string) (err error) {
 	debug.Log("create node %v at %v", node.Name, path)
 
 	switch node.Type {
 	case restic.NodeTypeDir:
-		if err := nodeCreateDirAt(node, path); err != nil {
-			return err
-		}
+		err = nodeCreateDirAt(node, path)
 	case restic.NodeTypeFile:
-		if err := nodeCreateFileAt(path); err != nil {
-			return err
-		}
+		err = nodeCreateFileAt(path)
 	case restic.NodeTypeSymlink:
-		if err := nodeCreateSymlinkAt(node, path); err != nil {
-			return err
-		}
+		err = nodeCreateSymlinkAt(node, path)
 	case restic.NodeTypeDev:
-		if err := nodeCreateDevAt(node, path); err != nil {
-			return err
-		}
+		err = nodeCreateDevAt(node, path)
 	case restic.NodeTypeCharDev:
-		if err := nodeCreateCharDevAt(node, path); err != nil {
-			return err
-		}
+		err = nodeCreateCharDevAt(node, path)
 	case restic.NodeTypeFifo:
-		if err := nodeCreateFifoAt(path); err != nil {
-			return err
-		}
+		err = nodeCreateFifoAt(path)
 	case restic.NodeTypeSocket:
-		return nil
+		err = nil
 	default:
-		return errors.Errorf("filetype %q not implemented", node.Type)
+		err = errors.Errorf("filetype %q not implemented", node.Type)
 	}
 
-	return nil
+	return err
 }
 
 func nodeCreateDirAt(node *restic.Node, path string) error {
@@ -315,7 +301,7 @@ func nodeRestoreTimestamps(node *restic.Node, path string) error {
 		return nodeRestoreSymlinkTimestamps(path, utimes)
 	}
 
-	if err := syscall.UtimesNano(path, utimes[:]); err != nil {
+	if err := syscall.UtimesNano(fixpath(path), utimes[:]); err != nil {
 		return errors.Wrap(err, "UtimesNano")
 	}
 

@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 
+	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
@@ -117,7 +119,8 @@ func TestNodeFromFileInfo(t *testing.T) {
 				return
 			}
 
-			node, err := NodeFromFileInfo(test.filename, fi, false)
+			fs := &Local{}
+			node, err := fs.NodeFromFileInfo(test.filename, fi, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -133,4 +136,13 @@ func TestNodeFromFileInfo(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMknodError(t *testing.T) {
+	d := t.TempDir()
+	// Call mkfifo, which calls mknod, as mknod may give
+	// "operation not permitted" on Mac.
+	err := mkfifo(d, 0)
+	rtest.Assert(t, errors.Is(err, os.ErrExist), "want ErrExist, got %q", err)
+	rtest.Assert(t, strings.Contains(err.Error(), d), "filename not in %q", err)
 }

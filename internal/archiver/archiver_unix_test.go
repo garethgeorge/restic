@@ -46,12 +46,23 @@ func wrapFileInfo(fi os.FileInfo) os.FileInfo {
 	return res
 }
 
+// wrapIrregularFileInfo returns a new os.FileInfo with the mode changed to irregular file
+func wrapIrregularFileInfo(fi os.FileInfo) os.FileInfo {
+	// wrap the os.FileInfo so we can return a modified stat_t
+	return wrappedFileInfo{
+		FileInfo: fi,
+		sys:      fi.Sys().(*syscall.Stat_t),
+		mode:     (fi.Mode() &^ os.ModeType) | os.ModeIrregular,
+	}
+}
+
 func statAndSnapshot(t *testing.T, repo archiverRepo, name string) (*restic.Node, *restic.Node) {
 	fi := lstat(t, name)
+	fs := &fs.Local{}
 	want, err := fs.NodeFromFileInfo(name, fi, false)
 	rtest.OK(t, err)
 
-	_, node := snapshot(t, repo, fs.Local{}, nil, name)
+	_, node := snapshot(t, repo, fs, nil, name)
 	return want, node
 }
 

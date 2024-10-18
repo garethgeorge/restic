@@ -256,7 +256,7 @@ func (arch *Archiver) trackItem(item string, previous, current *restic.Node, s I
 
 // nodeFromFileInfo returns the restic node from an os.FileInfo.
 func (arch *Archiver) nodeFromFileInfo(snPath, filename string, fi os.FileInfo, ignoreXattrListError bool) (*restic.Node, error) {
-	node, err := fs.NodeFromFileInfo(filename, fi, ignoreXattrListError)
+	node, err := arch.FS.NodeFromFileInfo(filename, fi, ignoreXattrListError)
 	if !arch.WithAtime {
 		node.AccessTime = node.ModTime
 	}
@@ -270,7 +270,8 @@ func (arch *Archiver) nodeFromFileInfo(snPath, filename string, fi os.FileInfo, 
 	}
 	// overwrite name to match that within the snapshot
 	node.Name = path.Base(snPath)
-	if err != nil {
+	// do not filter error for nodes of irregular or invalid type
+	if node.Type != restic.NodeTypeIrregular && node.Type != restic.NodeTypeInvalid && err != nil {
 		err = fmt.Errorf("incomplete metadata for %v: %w", filename, err)
 		return node, arch.error(filename, err)
 	}
