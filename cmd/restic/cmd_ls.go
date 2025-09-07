@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
@@ -36,6 +38,21 @@ will allow traversing into matching directories' subfolders.
 Any directory paths specified must be absolute (starting with
 a path separator); paths use the forward slash '/' as separator.
 
+SCRIPT MODE
+===========
+
+The --script-mode flag enables an interactive JSON-based interface
+for querying repository contents. This mode is designed for use by
+wrapper applications and provides significant performance benefits
+for multiple sequential queries by avoiding repository reinitialization.
+
+In script mode, the command reads JSON requests from stdin and writes
+JSON responses to stdout. Each request should be a single line containing:
+{"command": "ls", "path": "/example/path", "snapshot": "12345678"}
+
+Responses include node information and are terminated with {"type": "end"}.
+This feature requires the script-mode-for-ls feature flag to be enabled.
+
 EXIT STATUS
 ===========
 
@@ -59,6 +76,7 @@ type LsOptions struct {
 	Recursive     bool
 	HumanReadable bool
 	Ncdu          bool
+	ScriptMode    bool
 }
 
 var lsOptions LsOptions
@@ -72,6 +90,7 @@ func init() {
 	flags.BoolVar(&lsOptions.Recursive, "recursive", false, "include files in subfolders of the listed directories")
 	flags.BoolVar(&lsOptions.HumanReadable, "human-readable", false, "print sizes in human readable format")
 	flags.BoolVar(&lsOptions.Ncdu, "ncdu", false, "output NCDU export format (pipe into 'ncdu -f -')")
+	flags.BoolVar(&lsOptions.ScriptMode, "script-mode", false, "enable interactive script mode for querying repository contents via JSON stdin/stdout")
 }
 
 type lsPrinter interface {
@@ -277,57 +296,50 @@ func (p *textLsPrinter) Close() error {
 	return nil
 }
 
+// Script mode JSON structures
+type scriptRequest struct {
+	Command  string `json:"command"`
+	Path     string `json:"path"`
+	Snapshot string `json:"snapshot"`
+}
+
+type scriptResponse struct {
+	Type    string `json:"type"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// scriptLsPrinter implements lsPrinter interface for script mode
+type scriptLsPrinter struct {
+	enc *json.Encoder
+}
+
+func (p *scriptLsPrinter) Snapshot(sn *restic.Snapshot) error {
+	return nil // Skip snapshot output in script mode
+}
+
+func (p *scriptLsPrinter) Node(path string, node *restic.Node, isPrefixDirectory bool) error {
+	if isPrefixDirectory {
+		return nil
+	}
+	return lsNodeJSON(p.enc, path, node)
+}
+
+func (p *scriptLsPrinter) LeaveDir(_ string) error { return nil }
+func (p *scriptLsPrinter) Close() error            { return nil }
+
 func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []string) error {
+	if opts.ScriptMode {
+		if !feature.Flag.Enabled(feature.ScriptModeForLs) {
+			return errors.Fatal("script mode is not enabled, use RESTIC_FEATURES=script-mode-for-ls to enable")
+		}
+		return runLsScriptMode(ctx, opts, gopts)
+	}
 	if len(args) == 0 {
 		return errors.Fatal("no snapshot ID specified, specify snapshot ID or use special ID 'latest'")
 	}
 	if opts.Ncdu && gopts.JSON {
 		return errors.Fatal("only either '--json' or '--ncdu' can be specified")
-	}
-
-	// extract any specific directories to walk
-	var dirs []string
-	if len(args) > 1 {
-		dirs = args[1:]
-		for _, dir := range dirs {
-			if !strings.HasPrefix(dir, "/") {
-				return errors.Fatal("All path filters must be absolute, starting with a forward slash '/'")
-			}
-		}
-	}
-
-	withinDir := func(nodepath string) bool {
-		if len(dirs) == 0 {
-			return true
-		}
-
-		for _, dir := range dirs {
-			// we're within one of the selected dirs, example:
-			//   nodepath: "/test/foo"
-			//   dir:      "/test"
-			if fs.HasPathPrefix(dir, nodepath) {
-				return true
-			}
-		}
-		return false
-	}
-
-	approachingMatchingTree := func(nodepath string) bool {
-		if len(dirs) == 0 {
-			return true
-		}
-
-		for _, dir := range dirs {
-			// the current node path is a prefix for one of the
-			// directories, so we're interested in something deeper in the
-			// tree. Example:
-			//   nodepath: "/test"
-			//   dir:      "/test/foo"
-			if fs.HasPathPrefix(nodepath, dir) {
-				return true
-			}
-		}
-		return false
 	}
 
 	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
@@ -357,11 +369,137 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 			out: globalOptions.stdout,
 		}
 	} else {
+		// extract any specific directories to walk for text printer
+		var dirs []string
+		if len(args) > 1 {
+			dirs = args[1:]
+		}
 		printer = &textLsPrinter{
 			dirs:          dirs,
 			ListLong:      opts.ListLong,
 			HumanReadable: opts.HumanReadable,
 		}
+	}
+
+	return runLsWithSetup(ctx, opts, args, repo, snapshotLister, printer)
+}
+
+// runLsScriptMode implements the interactive script mode for ls command
+func runLsScriptMode(ctx context.Context, opts LsOptions, gopts GlobalOptions) error {
+	// Initialize repository once for all queries
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	snapshotLister, err := restic.MemorizeList(ctx, repo, restic.SnapshotFile)
+	if err != nil {
+		return err
+	}
+
+	bar := newIndexProgress(gopts.Quiet, true) // Always quiet in script mode
+	if err = repo.LoadIndex(ctx, bar); err != nil {
+		return err
+	}
+
+	// Setup JSON encoder for responses
+	enc := json.NewEncoder(globalOptions.stdout)
+	scanner := bufio.NewScanner(globalOptions.stdin)
+
+	// Send initialization complete signal
+	if err := enc.Encode(scriptResponse{Type: "ready", Message: "repository initialized"}); err != nil {
+		return err
+	}
+
+	// Main interactive loop
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var req scriptRequest
+		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			if err := enc.Encode(scriptResponse{Type: "error", Error: "invalid JSON: " + err.Error()}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Process the request using shared logic
+		if err := processScriptRequest(ctx, repo, snapshotLister, &req, opts, &scriptLsPrinter{enc: enc}); err != nil {
+			if err := enc.Encode(scriptResponse{Type: "error", Error: err.Error()}); err != nil {
+				return err
+			}
+		}
+
+		// Send end marker for this query
+		if err := enc.Encode(scriptResponse{Type: "end"}); err != nil {
+			return err
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// processScriptRequest handles a single script mode request using shared logic
+func processScriptRequest(ctx context.Context, repo restic.Repository, snapshotLister restic.Lister, req *scriptRequest, opts LsOptions, printer lsPrinter) error {
+	if req.Command != "ls" {
+		return errors.New("unsupported command: " + req.Command)
+	}
+
+	// Prepare args for shared logic
+	args := []string{req.Snapshot}
+	if req.Path != "" && req.Path != "/" {
+		args = append(args, req.Path)
+	}
+
+	// Use the shared listing logic from runLs
+	return runLsWithSetup(ctx, opts, args, repo, snapshotLister, printer)
+}
+
+// runLsWithSetup contains the shared listing logic extracted from runLs
+func runLsWithSetup(ctx context.Context, opts LsOptions, args []string, repo restic.Repository, snapshotLister restic.Lister, printer lsPrinter) error {
+	// extract any specific directories to walk
+	var dirs []string
+	if len(args) > 1 {
+		dirs = args[1:]
+		for _, dir := range dirs {
+			if !strings.HasPrefix(dir, "/") {
+				return errors.Fatal("All path filters must be absolute, starting with a forward slash '/'")
+			}
+		}
+	}
+
+	withinDir := func(nodepath string) bool {
+		if len(dirs) == 0 {
+			return true
+		}
+
+		for _, dir := range dirs {
+			if fs.HasPathPrefix(dir, nodepath) {
+				return true
+			}
+		}
+		return false
+	}
+
+	approachingMatchingTree := func(nodepath string) bool {
+		if len(dirs) == 0 {
+			return true
+		}
+
+		for _, dir := range dirs {
+			if fs.HasPathPrefix(nodepath, dir) {
+				return true
+			}
+		}
+		return false
 	}
 
 	sn, subfolder, err := (&restic.SnapshotFilter{

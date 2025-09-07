@@ -74,6 +74,55 @@ var lsTestNodes = []lsTestNode{
 		},
 	},
 
+	{
+		path: "/nested",
+		Node: restic.Node{
+			Name: "nested",
+			Type: restic.NodeTypeDir,
+			Mode: os.ModeDir | 0755,
+		},
+	},
+
+	// Nested directory structure to test recursive listing
+	{
+		path: "/bigfolder",
+		Node: restic.Node{
+			Name: "bigfolder",
+			Type: restic.NodeTypeDir,
+			Mode: os.ModeDir | 0755,
+		},
+	},
+
+	{
+		path: "/bigfolder/1.txt",
+		Node: restic.Node{
+			Name: "1.txt",
+			Type: restic.NodeTypeFile,
+			Size: 100,
+			Mode: 0644,
+		},
+	},
+
+	{
+		path: "/bigfolder/2.txt",
+		Node: restic.Node{
+			Name: "2.txt",
+			Type: restic.NodeTypeFile,
+			Size: 200,
+			Mode: 0644,
+		},
+	},
+
+	{
+		path: "/bigfolder/3.txt",
+		Node: restic.Node{
+			Name: "3.txt",
+			Type: restic.NodeTypeFile,
+			Size: 300,
+			Mode: 0644,
+		},
+	},
+
 	// Test encoding of setuid/setgid/sticky bit
 	{
 		path: "/some/sticky",
@@ -167,4 +216,51 @@ func TestLsNcdu(t *testing.T) {
 ]
 ]
 `, buf.String())
+}
+
+func TestScriptLsPrinter(t *testing.T) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	printer := &scriptLsPrinter{enc: enc}
+
+	// Test Snapshot method (should do nothing)
+	err := printer.Snapshot(&restic.Snapshot{
+		Hostname: "test-host",
+		Paths:    []string{"/test"},
+	})
+	rtest.OK(t, err)
+	rtest.Equals(t, "", buf.String()) // Should produce no output
+
+	// Test Node method with regular file
+	testNode := &restic.Node{
+		Name: "testfile.txt",
+		Type: restic.NodeTypeFile,
+		Size: 1024,
+		UID:  1000,
+		GID:  1000,
+	}
+
+	err = printer.Node("/test/testfile.txt", testNode, false)
+	rtest.OK(t, err)
+
+	// Verify JSON output matches lsNodeJSON format
+	var result map[string]interface{}
+	err = json.NewDecoder(&buf).Decode(&result)
+	rtest.OK(t, err)
+	rtest.Equals(t, "testfile.txt", result["name"])
+	rtest.Equals(t, "file", result["type"])
+	rtest.Equals(t, "/test/testfile.txt", result["path"])
+	rtest.Equals(t, float64(1024), result["size"])
+
+	// Test Node method with isPrefixDirectory=true (should do nothing)
+	buf.Reset()
+	err = printer.Node("/test/dir", &restic.Node{
+		Name: "dir",
+		Type: restic.NodeTypeDir,
+	}, true)
+	rtest.OK(t, err)
+	rtest.Equals(t, "", buf.String()) // Should produce no output
+
+	rtest.OK(t, printer.LeaveDir("/test"))
+	rtest.OK(t, printer.Close())
 }

@@ -216,6 +216,7 @@ func withTestEnvironment(t testing.TB) (env *testEnvironment, cleanup func()) {
 		// by t.Log.
 		stdout:   &logOutputter{t},
 		stderr:   &logOutputter{t},
+		stdin:    bytes.NewBuffer(nil),
 		extended: make(options.Options),
 
 		// replace this hook with "nil" if listing a filetype more than once is necessary

@@ -79,6 +79,7 @@ type GlobalOptions struct {
 	password string
 	stdout   io.Writer
 	stderr   io.Writer
+	stdin    io.Reader
 
 	backends                              *location.Registry
 	backendTestHook, backendInnerTestHook backendWrapper
@@ -98,6 +99,7 @@ type GlobalOptions struct {
 var globalOptions = GlobalOptions{
 	stdout: os.Stdout,
 	stderr: os.Stderr,
+	stdin:  os.Stdin,
 }
 
 func init() {
